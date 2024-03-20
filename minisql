@@ -1,0 +1,2 @@
+#!/bin/bash
+smlnj/bin/sml @SMLload minisql-image.*
