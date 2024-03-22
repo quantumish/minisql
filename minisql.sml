@@ -6,8 +6,7 @@ type row = JSON.value
 type rowvals = JSON.value list
 
 datatype value = String of string | Int of int | Column of columnref
-datatype binop = Eq of (value * value) | Neq of (value * value) |
-                 Gt of (value * value) | Lt of (value * value)
+datatype binop = Eq of (value * value) | Gt of (value * value) 
 datatype pred = Expr of binop | And of pred * pred | Or of pred * pred |
                 Not of pred | Next of pred | Until of pred * pred | True 
 datatype targets = Columns of columnref list | All
@@ -19,11 +18,17 @@ exception Type
 exception MalformedData
 exception NoSuchFile
 
+(* Constructed predicate types - no need to do additional work in the engine. *)
+fun Neq (x, y) = Not(Expr(Eq (x, y)))
+fun Lt (x, y) = And(Not(Expr(Gt (x, y))), Not(Expr(Eq (x, y))))
+
 fun Eventually x = Until(True, x)
 fun Henceforth x = Not(Eventually(Not x))
 fun WeakUntil (x, y) = Or(Until(x, y), Henceforth x)
 fun Release (x, y) = Not(Until(Not x, Not y))
 fun StrongRelease (x, y) = Not(WeakUntil(Not x, Not y))
+fun Within (x, 0) = x
+  | Within (x, i) = Or(Next(x), Next(Within(x, i-1)))
 
 (*--------------------------- Parsing logic. -----------------------------*)
 
@@ -62,15 +67,15 @@ fun parseValue getc = P.or'([
         P.wrap(parseRef, Column)
     ]) getc
 
-fun parseBinop getc = P.or'([
-        P.wrap(parseValue +> P.char #"=" %> parseValue, Eq),
-        P.wrap(parseValue +> P.char #">" %> parseValue, Gt),
+fun parseExpr getc = P.or'([
+        P.wrap(parseValue +> P.char #"=" %> parseValue, Expr o Eq),
+        P.wrap(parseValue +> P.char #">" %> parseValue, Expr o Gt),
         P.wrap(parseValue +> P.char #"<" %> parseValue, Lt),
         P.wrap(parseValue +> P.string "!=" %> parseValue, Neq)
     ]) getc
 
 fun parseSubexpr getc = P.or'([
-        P.wrap(parseBinop, Expr),
+        parseExpr,
         parseUnary,
         parseNested,
         parseLiteral
@@ -91,11 +96,12 @@ and parseBinary getc = P.or'([
         P.wrap(parseSubexpr +> P.string "UNTIL" %> parseSubexpr, Until),
         P.wrap(parseSubexpr +> P.string "WEAK UNTIL" %> parseSubexpr, WeakUntil),
         P.wrap(parseSubexpr +> P.string "RELEASE" %> parseSubexpr, Release),
-        P.wrap(parseSubexpr +> P.string "STRONG RELEASE" %> parseSubexpr, StrongRelease)
+        P.wrap(parseSubexpr +> P.string "STRONG RELEASE" %> parseSubexpr, StrongRelease),
+        P.wrap(parseSubexpr +> P.string "WITHIN" %> (Int.scan StringCvt.DEC), Within)
     ]) getc
 and parseNested getc = (P.char #"(" %> parseBinary @> P.char #")") getc
 
-fun parsePredicate getc = (P.or'([parseUnary, parseBinary, P.wrap(parseBinop, Expr), parseLiteral])) getc
+fun parsePredicate getc = (P.or'([parseUnary, parseBinary, parseExpr, parseLiteral])) getc
 
 (* Optionally applies a parser. On failure, parses to NONE instead of passing
  * an actual failure up and causing the overall parse to fail. *)
@@ -139,12 +145,8 @@ fun greater row x y =
     handle Option => raise BadQuery
                            
 (* Given a predicate and a row, check if the row satisfies the predicate. *)
-fun check (Expr(bop)) (row : row) (rest : row list) =
-    (case bop of
-         Eq(x, y) => equal row x y
-       | Neq(x, y) => not (equal row x y)
-       | Gt(x, y) => greater row x y
-       | Lt(x, y) => not (greater row x y) andalso not (equal row x y))
+fun check (Expr(Eq(x, y))) (row : row) (_ : row list) = equal row x y
+  | check (Expr(Gt(x, y))) row _ = greater row x y
   | check (And(p1, p2)) row rest = check p1 row rest andalso check p2 row rest
   | check (Or(p1, p2)) row rest = check p1 row rest orelse check p2 row rest
   | check (Not(p)) row rest = not (check p row rest)
@@ -171,7 +173,7 @@ fun predFilter (SOME p) L = filterWith (fn (r,rs) => check p r rs) L
   | predFilter NONE L = L
 
 (* Optionally filters for the first n elements of a list. *)
-fun optTake (SOME n) L = List.take (L, n)
+fun optTake (SOME n) L = if n >= List.length L then L else List.take (L, n)
   | optTake NONE L = L
 
 fun execute (Select(req, table, pred, lim)) : rowvals list * columnref list  =
@@ -232,9 +234,6 @@ fun loop () : unit =
                    | Parse => print "parse error\n"
                    | NoSuchFile => print "no such file\n")
     end
-
-val q = Select(All, "cities", SOME (Until(Expr(Eq(Column "region", String "South")),
-                                          Expr(Eq(Column "region", String "North")))), SOME 5)
               
 structure Main =
 struct
