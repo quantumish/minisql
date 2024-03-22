@@ -1,13 +1,15 @@
-type columnref = string;
-type tableref = string;
+type columnref = string
+type tableref = string
 (* Object containing (key, value) pairs. *)
-type row = JSON.value;
+type row = JSON.value
 (* List of values that gets displayed to user.  *)
-type rowvals = JSON.value list;
+type rowvals = JSON.value list
 
 datatype value = String of string | Int of int | Column of columnref
-datatype binop = Eq of (value * value) | Neq of (value * value) | Gt of (value * value) | Lt of (value * value)
-datatype pred = Expr of binop | And of pred * pred | Or of pred * pred
+datatype binop = Eq of (value * value) | Neq of (value * value) |
+                 Gt of (value * value) | Lt of (value * value)
+datatype pred = Expr of binop | And of pred * pred | Or of pred * pred |
+                Not of pred | Next of pred | Until of pred * pred | True 
 datatype targets = Columns of columnref list | All
 datatype query = Select of (targets * tableref * pred option * int option)
 
@@ -15,6 +17,13 @@ exception Parse
 exception BadQuery
 exception Type
 exception MalformedData
+exception NoSuchFile
+
+fun Eventually x = Until(True, x)
+fun Henceforth x = Not(Eventually(Not x))
+fun WeakUntil (x, y) = Or(Until(x, y), Henceforth x)
+fun Release (x, y) = Not(Until(Not x, Not y))
+fun StrongRelease (x, y) = Not(WeakUntil(Not x, Not y))
 
 (*--------------------------- Parsing logic. -----------------------------*)
 
@@ -62,18 +71,31 @@ fun parseBinop getc = P.or'([
 
 fun parseSubexpr getc = P.or'([
         P.wrap(parseBinop, Expr),
-        parseNested
+        parseUnary,
+        parseNested,
+        parseLiteral
     ]) getc
-and parseNested getc = (P.char #"(" %> P.or(
-       P.wrap(parseSubexpr +> P.string "AND" %> parseSubexpr, And),
-       P.wrap(parseSubexpr +> P.string "OR" %> parseSubexpr, Or)
-    ) @> P.char #")") getc
-
-fun parsePredicate getc = P.or'([
+and parseLiteral getc = P.or(
+        P.wrap(P.string("TRUE"), fn _ => True),
+        P.wrap(P.string("FALSE"), fn _ => Not(True))
+    ) getc
+and parseUnary getc = P.or'([
+        P.wrap(P.string "NOT" %> parseSubexpr, Not),
+        P.wrap(P.string "NEXT" %> parseSubexpr, Next),
+        P.wrap(P.string "EVENTUALLY" %> parseSubexpr, Eventually),
+        P.wrap(P.string "HENCEFORTH" %> parseSubexpr, Henceforth)
+    ]) getc
+and parseBinary getc = P.or'([
         P.wrap(parseSubexpr +> P.string "AND" %> parseSubexpr, And),
         P.wrap(parseSubexpr +> P.string "OR" %> parseSubexpr, Or),
-        P.wrap(parseBinop, Expr)
+        P.wrap(parseSubexpr +> P.string "UNTIL" %> parseSubexpr, Until),
+        P.wrap(parseSubexpr +> P.string "WEAK UNTIL" %> parseSubexpr, WeakUntil),
+        P.wrap(parseSubexpr +> P.string "RELEASE" %> parseSubexpr, Release),
+        P.wrap(parseSubexpr +> P.string "STRONG RELEASE" %> parseSubexpr, StrongRelease)
     ]) getc
+and parseNested getc = (P.char #"(" %> parseBinary @> P.char #")") getc
+
+fun parsePredicate getc = (P.or'([parseUnary, parseBinary, P.wrap(parseBinop, Expr), parseLiteral])) getc
 
 (* Optionally applies a parser. On failure, parses to NONE instead of passing
  * an actual failure up and causing the overall parse to fail. *)
@@ -115,16 +137,24 @@ fun greater row x y =
        | ((Column c1), (Column c2)) => JSONUtil.asInt (getCol row c1) > JSONUtil.asInt (getCol row c2)
        | _ => raise Type)
     handle Option => raise BadQuery
-
+                           
 (* Given a predicate and a row, check if the row satisfies the predicate. *)
-fun check (Expr(bop)) row : bool =
+fun check (Expr(bop)) (row : row) (rest : row list) =
     (case bop of
          Eq(x, y) => equal row x y
        | Neq(x, y) => not (equal row x y)
        | Gt(x, y) => greater row x y
        | Lt(x, y) => not (greater row x y) andalso not (equal row x y))
-  | check (And(p1, p2)) row = check p1 row andalso check p2 row
-  | check (Or(p1, p2)) row = check p1 row orelse check p2 row
+  | check (And(p1, p2)) row rest = check p1 row rest andalso check p2 row rest
+  | check (Or(p1, p2)) row rest = check p1 row rest orelse check p2 row rest
+  | check (Not(p)) row rest = not (check p row rest)
+  | check (Next(p)) row (next::rest) = check p next rest
+  | check (Next(_)) row [] = false
+  | check (Until(p1, p2)) row (next::rest) =
+    check p2 row (next::rest) orelse 
+    ((check p1 row (next::rest)) andalso (check (Until(p1, p2)) next rest))
+  | check (Until(p1, p2)) row [] = check p2 row []
+  | check True _ _ = true
 
 fun subset A B = List.all (fn x => List.exists (fn y => x = y) B) A
 
@@ -133,8 +163,11 @@ fun subset A B = List.all (fn x => List.exists (fn y => x = y) B) A
 fun getCols ((JSON.OBJECT r) : row) : columnref list = List.map (fn (name, _) => name) r
   | getCols _ = raise MalformedData
 
+fun filterWith f [] = []
+  | filterWith f (x::xs) = if f (x,xs) then x::(filterWith f xs) else filterWith f xs
+                      
 (* Optionally filters rows for those matching given predicate (if it exists). *)
-fun predFilter (SOME p) L = List.filter (fn r => check p r) L
+fun predFilter (SOME p) L = filterWith (fn (r,rs) => check p r rs) L
   | predFilter NONE L = L
 
 (* Optionally filters for the first n elements of a list. *)
@@ -153,6 +186,7 @@ fun execute (Select(req, table, pred, lim)) : rowvals list * columnref list  =
                   (optTake lim (predFilter pred (r::rs))),
          targets)
 end handle Match => raise MalformedData
+         | Io => raise NoSuchFile
 
 (*--------------------------- Display utilities. -----------------------------*)
 
@@ -196,9 +230,12 @@ fun loop () : unit =
                    | MalformedData => print "malformed data\n"
                    | Type => print "type error\n"
                    | Parse => print "parse error\n"
-                   | Io => print "no such file\n")
+                   | NoSuchFile => print "no such file\n")
     end
 
+val q = Select(All, "cities", SOME (Until(Expr(Eq(Column "region", String "South")),
+                                          Expr(Eq(Column "region", String "North")))), SOME 5)
+              
 structure Main =
 struct
 fun main (_, _) = let
