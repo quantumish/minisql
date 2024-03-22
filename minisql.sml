@@ -5,7 +5,8 @@ type row = JSON.value
 (* List of values that gets displayed to user.  *)
 type rowvals = JSON.value list
 
-datatype value = String of string | Int of int | Column of columnref
+datatype value = String of string | Int of int | Column of columnref | 
+                 CurColumn of columnref | Time of int 
 datatype binop = Eq of (value * value) | Gt of (value * value) 
 datatype pred = Expr of binop | And of pred * pred | Or of pred * pred |
                 Not of pred | Next of pred | Until of pred * pred | True 
@@ -60,10 +61,21 @@ fun parseCols getc = P.or(
 
 fun middle (_, (x, _)) = x
 fun isQuote x = (x = #"'" orelse x = #"\"") 
+
+fun parseTime getc = P.or'([
+        P.wrap((Int.scan StringCvt.DEC) @> P.string "seconds", Time),
+        P.wrap((Int.scan StringCvt.DEC) @> P.string "minutes", fn x => Time(x*60)),
+        P.wrap((Int.scan StringCvt.DEC) @> P.string "hours", fn x => Time(x*60*60)),
+        P.wrap((Int.scan StringCvt.DEC) @> P.string "days", fn x => Time(x*60*60*24)),
+        P.wrap((Int.scan StringCvt.DEC) @> P.string "weeks", fn x => Time(x*60*60*24*7))
+    ]) getc
+
 fun parseValue getc = P.or'([
         P.wrap((P.eatChar isQuote) *> P.token (fn x => not (isQuote x)) 
-               *> (P.eatChar isQuote), (String o middle)),
+               *> (P.eatChar isQuote), (String o middle)),        
+        parseTime,
         P.wrap(Int.scan StringCvt.DEC, Int),
+        P.wrap(P.string "cur." *> parseRef, CurColumn o #2),
         P.wrap(parseRef, Column)
     ]) getc
 
@@ -125,38 +137,55 @@ fun jsonEqual (JSON.INT x) (JSON.INT y)  = x = y
   | jsonEqual (JSON.STRING x) (JSON.STRING y) = x = y
   | jsonEqual _ _ = raise Type
 
-fun equal row x y =
+fun equal row x y cur =
     if x = y then true else
     (case (x, y) of
          ((String _), (Int _)) => raise Type
-       | ((Column c1), (Column c2)) => jsonEqual (getCol row c1) (getCol row c2)
-       | ((String x), (Column c)) => x = JSONUtil.asString (getCol row c)
        | ((Int x), (Column c)) => x = JSONUtil.asInt (getCol row c)
-       | (x,y) => equal row y x)
+       | ((Time x), (Column c)) => x = JSONUtil.asInt (getCol row c)
+       | ((String x), (Column c)) => x = JSONUtil.asString (getCol row c)
+       | ((Column c1), (Column c2)) => jsonEqual (getCol row c1) (getCol row c2)
+       | ((CurColumn c1), (Column c2)) => jsonEqual (getCol cur c1) (getCol row c2)
+       | ((CurColumn c1), _) => raise Type
+       | ((Time _), _) => raise Type
+       | (x,y) => equal row y x cur)
     handle Option => raise BadQuery
 
-fun greater row x y =
+(* TODO could be cleaned *)
+fun greater row x y cur =
     (case (x, y) of
          ((Int x), (Int y)) => x > y
+       | ((Time x), (Time y)) => x > y
        | ((Int x), (Column c)) => x > JSONUtil.asInt (getCol row c)
        | ((Column c), (Int x)) => JSONUtil.asInt (getCol row c) > x
+       | ((Time x), (Column c)) => x > JSONUtil.asInt (getCol row c)
+       | ((Column c), (Time x)) => JSONUtil.asInt (getCol row c) > x
        | ((Column c1), (Column c2)) => JSONUtil.asInt (getCol row c1) > JSONUtil.asInt (getCol row c2)
+       | ((CurColumn c1), (Column c2)) => JSONUtil.asInt (getCol cur c1) > JSONUtil.asInt (getCol row c2)
+       | ((Column c1), (CurColumn c2)) => JSONUtil.asInt (getCol row c1) > JSONUtil.asInt (getCol cur c2)
        | _ => raise Type)
     handle Option => raise BadQuery
-                           
+                                                      
 (* Given a predicate and a row, check if the row satisfies the predicate. *)
-fun check (Expr(Eq(x, y))) (row : row) (_ : row list) = equal row x y
-  | check (Expr(Gt(x, y))) row _ = greater row x y
-  | check (And(p1, p2)) row rest = check p1 row rest andalso check p2 row rest
-  | check (Or(p1, p2)) row rest = check p1 row rest orelse check p2 row rest
-  | check (Not(p)) row rest = not (check p row rest)
-  | check (Next(p)) row (next::rest) = check p next rest
-  | check (Next(_)) row [] = false
-  | check (Until(p1, p2)) row (next::rest) =
-    check p2 row (next::rest) orelse 
-    ((check p1 row (next::rest)) andalso (check (Until(p1, p2)) next rest))
-  | check (Until(p1, p2)) row [] = check p2 row []
-  | check True _ _ = true
+fun check p row (start, future) = let
+    val st = Option.getOpt (start, row)
+    val S = (start, future)
+in
+    (case (p, future) of         
+         (Expr(Eq(x, y)), _) => equal row x y st
+       | (Expr(Gt(x, y)), _) => greater row x y st
+       | (And(p1, p2), ft) => check p1 row S andalso check p2 row S
+       | (Or(p1, p2), ft) => check p1 row S orelse check p2 row S
+       | (Not(p), f) => not (check p row S)
+       | (Next(_), []) => false
+       | (Next(p), (next::ft)) => check p next (SOME st, ft)
+       | (Until(p1, p2), []) => check p2 row (SOME st, [])
+       | (Until(p1, p2), (next::rest)) =>
+         check p2 row (SOME st, next::rest) orelse
+         ((check p1 row (SOME st, next::rest)) andalso
+          (check (Until(p1, p2)) next (SOME st, rest)))
+       | (True, _) => true)
+end
 
 fun subset A B = List.all (fn x => List.exists (fn y => x = y) B) A
 
@@ -169,7 +198,7 @@ fun filterWith f [] = []
   | filterWith f (x::xs) = if f (x,xs) then x::(filterWith f xs) else filterWith f xs
                       
 (* Optionally filters rows for those matching given predicate (if it exists). *)
-fun predFilter (SOME p) L = filterWith (fn (r,rs) => check p r rs) L
+fun predFilter (SOME p) L = filterWith (fn (r,rs) => check p r (NONE, rs)) L
   | predFilter NONE L = L
 
 (* Optionally filters for the first n elements of a list. *)
@@ -187,8 +216,8 @@ fun execute (Select(req, table, pred, lim)) : rowvals list * columnref list  =
         (List.map (fn row => List.map (fn c => getCol row c) targets)
                   (optTake lim (predFilter pred (r::rs))),
          targets)
-end handle Match => raise MalformedData
-         | Io => raise NoSuchFile
+end (* handle Match => raise MalformedData *)
+    (*      | Io => raise NoSuchFile *)
 
 (*--------------------------- Display utilities. -----------------------------*)
 
