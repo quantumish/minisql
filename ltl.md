@@ -15,7 +15,7 @@ The two main operators then allow you to build up more complex operators:
 
 LTL is used primarily for formal verification of systems (which you could imagine in many cases would need to encode time-dependent constraints) and also is partially what the TLA language is built on top of! Probably the most interesting application I saw for it was encoding invariants about parallelism in [Michigan State's slides](https://www.cse.msu.edu/~cse814/Lectures/14_introLTL.pdf) on the topic. Say for example you have a critical section of code guarded by a mutex. Let $\text{inCS}_X$ denote a process $X$ being in the critical section: 
 - Mutual exclusion is expressed by: $\square(\lnot \text{inCS}_A \lor \lnot\text{inCS}_B)$ (in English: it is always true that either A is or B is not in the critical section)
-- You can also express that $A$ doesn't monopolize the lock: $\square(\text{inCS}_A \implies \diamondsuit \lnot\text{inCS}_A)$ (in English: $A$ holding the lock implies it will eventually not hold the lock).
+- You can also express that $A$ doesn't monopolize the lock: $\square(\text{inCS}_A \implies \diamondsuit \lnot\text{inCS}_A)$ (in English: it is always true that $A$ holding the lock implies it will eventually not hold the lock).
 
 Those slides also include some cool formalizations of fairness guarantees for the dining philosophers problem!
 
@@ -31,7 +31,7 @@ fun filterWith f [] = []
   | filterWith f (x::xs) = if f(x, xs) then x::(filter f xs) else (filter f xs)
 ```
 
-The parser is also implemented in a fashion where adding more unary and binary constructs isn't a big ask. The execution engine has to track where it "started" (the row that is actually being checked against the predicate), but otherwise these future-oriented predicates can be computed pretty easily by recursing on the rest of the list.
+The parser is also implemented in a fashion where adding more unary and binary constructs isn't a big ask. The execution engine now has to track where it "started" (the row that is actually being checked against the predicate), but otherwise these future-oriented predicates can be computed pretty easily by recursing on the rest of the list.
 
 Once we implement support for next and until, we can just have the parser automatically translate the more complex queries to be in terms of the two basic primitives via "artificial" constructors like: 
 ```sml
@@ -56,7 +56,7 @@ Let's start with a simple dataset: say we have a simple business with one produc
 
 `sequsers.json` is a table where each row represents what happened in a day and the rows are laid out chronologically (e.g. first day is the first row).
 
-Let's try the simplest possible LTL query: maybe we're interested in predicting what events could indicate that a new client is going to buy our product. To do that we'd want all events that _precede_ a new client:
+Let's try the simplest possible LTL query: maybe we're interested in predicting what events could indicate that a client is going to buy our product. To do that we'd want all events that _precede_ a buy order:
 ```
 $ ./minisql
 SELECT * FROM sequsers WHERE NEXT action = 'buy' LIMIT 10;
@@ -111,7 +111,7 @@ Okay, let's try actually doing the query mentioned in the challenge ("get all cu
 ```sql
 SELECT * FROM sequsers WHERE action = 'buy' AND (action = 'leave' WITHIN 14);
 ```
-Here the `WITHIN` operator is syntactic sugar over nested `Or(Next x, Next(Or, Next (...)))`:
+Here the `WITHIN` operator is syntactic sugar over nested `Or` and `Next` clauses:
 ```sml
 fun Within (x, 0) = x
   | Within (x, i) = Or(Next(x), Next(Within(x, i-1)))
