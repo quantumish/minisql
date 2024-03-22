@@ -7,7 +7,7 @@ Run `install.sh` which will automatically install SML locally and compile `minis
 ## usage 
 Run `./minisql` to run queries. No need for a command line argument: simply use the name of the JSON file you want to query as the name of the table in your query and `minisql` will parse it on the fly.
 
-You can generate some sample data to play with by running `randgen.py`. This will make a file called `cities.json` with randomized data.
+You can generate some sample data to play with by running `randgen.py`. See `ltl.md` for more info.
 
 Example query (over the file `cities.json` in the current directory):
 ```
