@@ -6,8 +6,8 @@ type row = JSON.value
 type rowvals = JSON.value list
 
 datatype value = String of string | Int of int | Column of columnref | 
-                 CurColumn of columnref | Time of int 
-datatype binop = Eq of (value * value) | Gt of (value * value) 
+                 CurColumn of columnref | Time of int | Sub of value * value
+datatype binop = Eq of value * value | Gt of value * value 
 datatype pred = Expr of binop | And of pred * pred | Or of pred * pred |
                 Not of pred | Next of pred | Until of pred * pred | True 
 datatype targets = Columns of columnref list | All
@@ -30,6 +30,7 @@ fun Release (x, y) = Not(Until(Not x, Not y))
 fun StrongRelease (x, y) = Not(WeakUntil(Not x, Not y))
 fun Within (x, 0) = x
   | Within (x, i) = Or(Next(x), Next(Within(x, i-1)))
+
 
 (*--------------------------- Parsing logic. -----------------------------*)
 
@@ -70,17 +71,21 @@ fun parseTime getc = P.or'([
         P.wrap((Int.scan StringCvt.DEC) @> P.string "weeks", fn x => Time(x*60*60*24*7))
     ]) getc
 
-fun parseValue getc = P.or'([
+fun parseSimpleValue getc = P.or'([
         P.wrap((P.eatChar isQuote) *> P.token (fn x => not (isQuote x)) 
                *> (P.eatChar isQuote), (String o middle)),        
         parseTime,
         P.wrap(Int.scan StringCvt.DEC, Int),
         P.wrap(P.string "cur." *> parseRef, CurColumn o #2),
-        P.wrap(parseRef, Column)
+        P.wrap(parseRef, Column)        
     ]) getc
+and parseValue getc = P.or(
+        P.wrap(parseSimpleValue +> P.char #"-" %> parseSimpleValue, Sub),
+        parseSimpleValue
+    ) getc
 
 fun parseExpr getc = P.or'([
-        P.wrap(parseValue +> P.char #"=" %> parseValue, Expr o Eq),
+        P.wrap(parseValue +> P.char #"=" %> parseValue, Expr o Eq),        
         P.wrap(parseValue +> P.char #">" %> parseValue, Expr o Gt),
         P.wrap(parseValue +> P.char #"<" %> parseValue, Lt),
         P.wrap(parseValue +> P.string "!=" %> parseValue, Neq)
@@ -137,15 +142,19 @@ fun jsonEqual (JSON.INT x) (JSON.INT y)  = x = y
   | jsonEqual (JSON.STRING x) (JSON.STRING y) = x = y
   | jsonEqual _ _ = raise Type
 
+fun colInt row c = JSONUtil.asInt (getCol row c)
+fun colStr row c = JSONUtil.asString (getCol row c)
+
 fun equal row x y cur =
     if x = y then true else
     (case (x, y) of
          ((String _), (Int _)) => raise Type
-       | ((Int x), (Column c)) => x = JSONUtil.asInt (getCol row c)
-       | ((Time x), (Column c)) => x = JSONUtil.asInt (getCol row c)
-       | ((String x), (Column c)) => x = JSONUtil.asString (getCol row c)
+       | ((Int x), (Column c)) => x = colInt row c
+       | ((Time x), (Column c)) => x = colInt row c
+       | ((String x), (Column c)) => x = colStr row c
        | ((Column c1), (Column c2)) => jsonEqual (getCol row c1) (getCol row c2)
        | ((CurColumn c1), (Column c2)) => jsonEqual (getCol cur c1) (getCol row c2)
+       | ((Time x), (Time y)) => x = y (* sml doesn't recognize Time as an eq type? *)
        | ((CurColumn c1), _) => raise Type
        | ((Time _), _) => raise Type
        | (x,y) => equal row y x cur)
@@ -156,24 +165,33 @@ fun greater row x y cur =
     (case (x, y) of
          ((Int x), (Int y)) => x > y
        | ((Time x), (Time y)) => x > y
-       | ((Int x), (Column c)) => x > JSONUtil.asInt (getCol row c)
-       | ((Column c), (Int x)) => JSONUtil.asInt (getCol row c) > x
-       | ((Time x), (Column c)) => x > JSONUtil.asInt (getCol row c)
-       | ((Column c), (Time x)) => JSONUtil.asInt (getCol row c) > x
-       | ((Column c1), (Column c2)) => JSONUtil.asInt (getCol row c1) > JSONUtil.asInt (getCol row c2)
-       | ((CurColumn c1), (Column c2)) => JSONUtil.asInt (getCol cur c1) > JSONUtil.asInt (getCol row c2)
-       | ((Column c1), (CurColumn c2)) => JSONUtil.asInt (getCol row c1) > JSONUtil.asInt (getCol cur c2)
+       | ((Int x), (Column c)) => x > (colInt row c)
+       | ((Column c), (Int x)) => (colInt row c) > x
+       | ((Time x), (Column c)) => x > (colInt row c)
+       | ((Column c), (Time x)) => (colInt row c) > x
+       | ((Column c1), (Column c2)) =>  (colInt row c1) > (colInt row c2)
+       | ((CurColumn c1), (Column c2)) => (colInt cur c1) > (colInt row c2)
+       | ((Column c1), (CurColumn c2)) => (colInt row c1) > (colInt cur c2)
        | _ => raise Type)
     handle Option => raise BadQuery
-                                                      
+                        
+fun eval (Sub(x, y)) row cur = 
+    (case (x,y) of 
+         (Column(c1), Column(c2)) => Time((colInt row c1) - (colInt row c2))
+       | (CurColumn(c1), CurColumn(c2)) => Time((colInt cur c1) - (colInt cur c2))
+       | (Column(c1), CurColumn(c2)) => Time((colInt row c1) - (colInt cur c2))
+       | (CurColumn(c1), Column(c2)) => Time((colInt cur c1) - (colInt row c2))
+       | _ => raise Type)
+  | eval x _ _ = x
+
 (* Given a predicate and a row, check if the row satisfies the predicate. *)
 fun check p row (start, future) = let
     val st = Option.getOpt (start, row)
     val S = (start, future)
 in
     (case (p, future) of         
-         (Expr(Eq(x, y)), _) => equal row x y st
-       | (Expr(Gt(x, y)), _) => greater row x y st
+         (Expr(Eq(x, y)), _) => equal row (eval x row st) (eval y row st) st
+       | (Expr(Gt(x, y)), _) => greater row (eval x row st) (eval y row st) st
        | (And(p1, p2), ft) => check p1 row S andalso check p2 row S
        | (Or(p1, p2), ft) => check p1 row S orelse check p2 row S
        | (Not(p), f) => not (check p row S)
@@ -216,8 +234,8 @@ fun execute (Select(req, table, pred, lim)) : rowvals list * columnref list  =
         (List.map (fn row => List.map (fn c => getCol row c) targets)
                   (optTake lim (predFilter pred (r::rs))),
          targets)
-end (* handle Match => raise MalformedData *)
-    (*      | Io => raise NoSuchFile *)
+end handle Match => raise MalformedData
+         | Io => raise NoSuchFile
 
 (*--------------------------- Display utilities. -----------------------------*)
 
