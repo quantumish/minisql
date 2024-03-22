@@ -1,19 +1,22 @@
 # Linear Temporal Logic
 
 ## What is LTL? 
+> [!NOTE]
+> Github's inline $\LaTeX$ is somewhat limited in what it allows you to write, so some of this notation is really just abusing similar-looking symbols.
 
 Linear temporal logic is an extension of propositional logic that allows for reasoning over arbitrary time streams. The two core operators it provides are the _next_ operator $\circ \varphi$ that is true iff $\varphi$ is true at the next state and the _until_ operator $\varphi \cup \psi$ that is true iff $\psi$ is true at some future or current state and $\varphi$ is true at all states preceding it. 
 
 The two main operators then allow you to build up more complex operators:
 - The _eventually_ operator $\diamondsuit$ which is defined as $\diamondsuit \varphi = true \cup \varphi$ 
 - The _henceforth_ operator $\square$ defined as $\lnot \diamondsuit \lnot \varphi$
-- The _weak until_ operator $\varphi \operatorname{W} \psi$ defined as $(\varphi \cup \psi) \lor \square \varphi$ which relaxes the constraint of the until operator that the second condition must be satisfied at some point.
-- The _release_ operator $\varphi \operatorname{R} \psi$ is defined as $\lnot(\lnot\varphi \cup \lnot \psi)$ which is true iff $\psi$ always holds until "released" by $\varphi$ being true.
+- The _weak until_ operator $\varphi \text{ W } \psi$ defined as $(\varphi \cup \psi) \lor \square \varphi$ which relaxes the constraint of the until operator that the second condition must be satisfied at some point.
+- The _release_ operator $\varphi \text{ R } \psi$ is defined as $\lnot(\lnot\varphi \cup \lnot \psi)$ which is true iff $\psi$ always holds until "released" by $\varphi$ being true.
 (the names for these operators can vary - what I've written here is the verbiage `minisql` uses) 
 
 LTL is used primarily for formal verification of systems (which you could imagine in many cases would need to encode time-dependent constraints) and also is partially what the TLA language is built on top of! Probably the most interesting application I saw for it was encoding invariants about parallelism in [Michigan State's slides](https://www.cse.msu.edu/~cse814/Lectures/14_introLTL.pdf) on the topic. Say for example you have a critical section of code guarded by a mutex. Let $\text{inCS}_X$ denote a process $X$ being in the critical section: 
-- Mutual exclusion is expressed by: $\square(\lnot \text{inCS}_A \lor \lnot\text{inCS}_B$ (in English: it is always true that either A is or B is not in the critical section)
-- You can also express that $A$ doesn't monopolize the lock: $\square(\text{inCS}_A \implies \diamondsuit \lnot\text{inCS}_A$ (in English: $A$ holding the lock implies it will eventually not hold the lock).
+- Mutual exclusion is expressed by: $\square(\lnot \text{inCS}_A \lor \lnot\text{inCS}_B)$ (in English: it is always true that either A is or B is not in the critical section)
+- You can also express that $A$ doesn't monopolize the lock: $\square(\text{inCS}_A \implies \diamondsuit \lnot\text{inCS}_A)$ (in English: $A$ holding the lock implies it will eventually not hold the lock).
+
 Those slides also include some cool formalizations of fairness guarantees for the dining philosophers problem!
 
 ## Adding Support (this can be skipped)
@@ -45,7 +48,10 @@ Now we can mess with some queries! Note that all of this data can be generated v
 ### Simple Queries
 Let's start with a simple dataset: say we have a simple business with one product that can meet with up to one client businesses a day. These clients have a limited number of actions as described by the following FSM:
 
-![](./fsm.png])
+<p align="center">
+  <img src="./fsm.png">
+</p>
+
 "New" is short for a client coming in contact with our business, "buy" is them buying our product, "com" is them complaining about it, "ret" is them returning it, and "leave" is them vowing to never work with us again.
 
 `sequsers.json` is a table where each row represents what happened in a day and the rows are laid out chronologically (e.g. first day is the first row).
@@ -67,7 +73,7 @@ new    | Macrospore Corp.   | 86109     |
 buy    | Attendant Corp.    | 18739     | 
 ```
 Is this correct? Let's peek at the first 15 rows of the actual data using `viewer.py`:
-```
+```python
 $ python viewer.py sequsers.json 15
 {'action': 'new', 'name': 'Irrevocablaginable Corp.', 'headcount': 65498}
 {'action': 'new', 'name': 'Psychopathologist Corp.', 'headcount': 43556}
@@ -89,20 +95,20 @@ The first two buy actions line up with our output!
 
 Let's try some more sample queries: 
 - Get all returns that are followed by a buy order.
-```
+```sql
 SELECT name FROM sequsers WHERE action = 'return' AND EVENTUALLY action = 'buy';
 ```
 - Get all chains of new users followed by a buy order:
-```
+```sql
 SELECT name, headcount FROM sequsers WHERE action = 'new' UNTIL action = 'buy';
 ```
 - Get all events preceding large clients leaving us:
-```
+```sql
 SELECT * FROM sequsers WHERE NEXT (action = 'leave' AND headcount > 10000);
 ```
 
 Okay, let's try actually doing the query mentioned in the challenge ("get all customers who returned product within 2 weeks"). The best we can do with plain old linear temporal logic is something like:
-```
+```sql
 SELECT * FROM sequsers WHERE action = 'buy' AND (action = 'leave' WITHIN 14);
 ```
 Here the `WITHIN` operator is syntactic sugar over nested `Or(Next x, Next(Or, Next (...)))`:
@@ -117,18 +123,18 @@ Yet this isn't really what we want: all this results in is all events that are w
 Some variants of LTL solve the problem we had earlier by introducing operators that let you refer to _past_ values. This is a bit overkill for our concerns and it also would make the code a bit less pleasant. Instead, `minisql` introduces the notion of the "current" row for use in predicates.
 
 For example, we can query all users who returned our product with:
-```
+```sql
 SELECT * FROM sequsers WHERE action = 'buy' AND EVENTUALLY (name = cur.name AND action = 'return');
 ```
 While `name` and `action` columns will refer to the columns of the state currently being checked at any point in the timestream, `cur.name` refers to the column of the current state.
 
 We can also write the earlier query now: 
-```
+```sql
 SELECT * FROM sequsers WHERE action = 'buy' AND ((name = cur.name AND action = 'return') WITHIN 14);
 ```
 
 In general this expands the number of actually meaningful predicates we can make. Say we're interested in all the complaints that come from companies who have shrunk their headcounts since they bought our product (maybe they're just haggling to cut expenses...) 
-```
+```sql
 SELECT name FROM sequsers WHERE action = 'buy' AND EVENTUALLY (name = cur.name AND (action = 'return' AND headcount < cur.headcount));
 ```
 
@@ -136,7 +142,7 @@ SELECT name FROM sequsers WHERE action = 'buy' AND EVENTUALLY (name = cur.name A
 Okay, but there's still a big constraint on our data here: only one event can happen per day (or alternatively our only notion of time is the event number). Let's now consider `users.json` which is exactly the same as `sequsers.json` except for the fact that there is now a `time` column with the time of the event as a Unix timestamp. Combining the very limited time operations provided by `minisql` with the temporally dependent queries lets us finally do this the _right_ way.
 
 To get all clients who bought and returned their product within two weeks, write 
-```
+```sql
 SELECT name, headcount FROM users WHERE action = 'buy' AND EVENTUALLY (name = cur.name AND (action = 'return' AND time - cur.time < 2 weeks));
 ```
 On my randomly generated copy, this returns 
@@ -148,7 +154,7 @@ Preoperating Corp. | 20880     |
 ```
 
 Sure enough, `grep`ping for "Mathurin" yields they did buy and return within about a week:
-```
+```python
 $ python viewer.py users.json 1000 | grep Mathurin
 {'time': 1725139942, 'action': 'new', 'name': 'Mathurin Corp.', 'headcount': 96156}
 {'time': 1755384672, 'action': 'buy', 'name': 'Mathurin Corp.', 'headcount': 75192}
